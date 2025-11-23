@@ -5,23 +5,21 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.fernet import Fernet
 
-# ---------------------------------------------------------
-# PART 1: Diffie–Hellman Key Exchange
-# ---------------------------------------------------------
+#before any communication first key exchange will be done then encryption/decryption will be performed
+#First server will generate the parameters of diffie-hellman(p and g) using the first function and generate
+#its public and private key using the second function and finally send parameters and public key of server to client
+#then client will generate its private and public key using the second function and send its public key to server
+#then both server and client will generate derived key using 3rd function (boht of them have same key now)(its exactly same as what we did in IS lectures)
+#now simply both server and client can encrypt and decrypt data by using the encrypt and decrypt functions in last
 
+
+#function to create large prime p and generator (public)
 def generate_dh_parameters():
-    """
-    Generates Diffie–Hellman parameters (shared by both parties).
-    Should be done once on server; client receives parameters.
-    """
-    return dh.generate_parameters(generator=2, key_size=2048)
+    return dh.generate_parameters(generator=2, key_size=2048)  # g=2 and p is very large coz 2048 bits
 
 
+#generatin of public and private keys 
 def generate_dh_keypair(parameters):
-    """
-    Generate a DH private/public key pair.
-    Returns: (private_key, public_key_bytes)
-    """
     private_key = parameters.generate_private_key()
     public_key = private_key.public_key()
 
@@ -33,15 +31,12 @@ def generate_dh_keypair(parameters):
     return private_key, public_bytes
 
 
+#function to create shared common key
 def compute_shared_key(private_key, peer_public_bytes):
-    """
-    Given our private key and peer's public bytes,
-    compute the shared secret and derive a Fernet-compatible key.
-    """
     peer_public_key = serialization.load_pem_public_key(peer_public_bytes)
     shared_secret = private_key.exchange(peer_public_key)
 
-    # Derive 32-byte symmetric key using HKDF
+    # Derive 32-byte symmetric key using HKDF coz fernet requires 32 byte key not the one we generated (shared key)
     derived_key = HKDF(
         algorithm=hashes.SHA256(),
         length=32,
@@ -53,25 +48,14 @@ def compute_shared_key(private_key, peer_public_bytes):
     fernet_key = base64.urlsafe_b64encode(derived_key)
     return fernet_key
 
-# ---------------------------------------------------------
-# PART 2: AES + HMAC Encryption (Fernet)
-# ---------------------------------------------------------
 
+#encryption and decryption functions 
+# Fernet(internally uses AES-123) is used for encryption and decryption with HMAC for authentication
 def encrypt_data(shared_key, plaintext_bytes):
-    """
-    Encrypt data using AES-128 + HMAC-SHA256 (Fernet).
-    shared_key: Fernet-compatible 32-byte base64 key
-    plaintext_bytes: bytes
-    """
     cipher = Fernet(shared_key)
     return cipher.encrypt(plaintext_bytes)
 
 
 def decrypt_data(shared_key, encrypted_bytes):
-    """
-    Decrypt data using AES-128 + HMAC-SHA256 (Fernet).
-    shared_key: Fernet-compatible 32-byte base64 key
-    encrypted_bytes: bytes
-    """
     cipher = Fernet(shared_key)
     return cipher.decrypt(encrypted_bytes)
