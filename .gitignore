@@ -1,4 +1,5 @@
 # Python cache files
+dh_params.pem
 __pycache__/
 *.py[cod]
 *$py.class
@@ -7,6 +8,7 @@ __pycache__/
 venv/
 env/
 .venv/
+.python-version
 
 # Editor files
 .vscode/
@@ -20,4 +22,27 @@ Thumbs.db
 
 # Secrets / config
 *.key
+*.pem
+*.crt
+*.der
 config.json
+secret.env
+
+# Bytecode & build artifacts
+build/
+dist/
+*.egg-info/
+
+# Logs & runtime files
+*.log
+*.pid
+
+# Networking test captures
+*.pcap
+*.pcapng
+
+# Temporary / misc
+tmp/
+*.tmp
+*.bak
+*.swp
