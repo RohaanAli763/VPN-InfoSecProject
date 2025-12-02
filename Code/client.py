@@ -2,24 +2,22 @@ import socket
 from encryption import generate_dh_keypair, compute_shared_key, encrypt_data, decrypt_data
 from cryptography.hazmat.primitives.serialization import load_pem_parameters
 
-SERVER_HOST = '127.0.0.1'  # localhost for testing change to server IP for real use
+SERVER_HOST = '127.0.0.1'   # need to change this when using actual server
 SERVER_PORT = 5555
 BUF = 65536
 
 def main():
     try:
-        # connect to server
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         print(f"[*] connecting to {SERVER_HOST}:{SERVER_PORT}")
         sock.connect((SERVER_HOST, SERVER_PORT))
-        print("[+] connected!")
+        print("[+] connected!\n")
 
-        # helper to send length-prefixed blob
+        # helpers
         def send_blob(b):
             sock.sendall(len(b).to_bytes(4, 'big'))
             sock.sendall(b)
 
-        # helper to receive length-prefixed blob
         def recv_blob():
             raw_len = sock.recv(4)
             if not raw_len:
@@ -33,65 +31,64 @@ def main():
                 data += chunk
             return data
 
-        # receive dh parameters from server
-        print("[*] receiving DH parameters..")
+        # dh handshake
+        print("[*] receiving DH parameters...")
         params_bytes = recv_blob()
         client_params = load_pem_parameters(params_bytes)
 
-        # receive server's public key
-        print("[*] receiving server public key..")
+        print("[*] receiving server public key...")
         server_pub_bytes = recv_blob()
 
-        # generate client's own keypair using the received parameters
         print("[*] generating client keypair...")
         client_priv, client_pub_bytes = generate_dh_keypair(client_params)
 
-        # send client's public key to server
         print("[*] sending client public key...")
         send_blob(client_pub_bytes)
 
-        # compute shared secret
         shared_key = compute_shared_key(client_priv, server_pub_bytes)
-        print("[+] shared key established! encryption active.")
-        print()
+        print("[+] shared key established. Encryption active.\n")
 
-        # now we can send encrypted messages
-        print("You can now send messages to the server.")
-        print("Type your message and press Enter.")
-        print("Type 'quit' to exit.")
-        print()
+        # vpn mode
+        print("You can now send requests through the VPN.")
+        print("Format:  host  port  message")
+        print("Example: google.com 80 GET / HTTP/1.1")
+        print("Type quit to exit.\n")
 
         while True:
-            # get message from user
-            msg = input("You: ").strip()
-            
-            if msg.lower() == 'quit':
-                print("closing connection...")
+            user_in = input("Enter host:port message → ")
+
+            if user_in.lower() == "quit":
                 break
 
-            if not msg:
+            try:
+                # user input format
+                parts = user_in.split(" ", 2)
+                host = parts[0]
+                port = parts[1]
+                message = parts[2]
+            except:
+                print("Invalid format. Use: host port message")
                 continue
 
-            # encrypt and send
-            enc_msg = encrypt_data(shared_key, msg.encode('utf-8'))
-            send_blob(enc_msg)
-            print("message sent (encrypted)")
+            # format: host|port|payload
+            payload = f"{host}|{port}|{message}"
+            enc = encrypt_data(shared_key, payload.encode())
+            send_blob(enc)
 
-            # receive encrypted reply
+            # receive encrypted reply from server
             enc_reply = recv_blob()
-            plaintext_reply = decrypt_data(shared_key, enc_reply)
-            print(f"Server: {plaintext_reply.decode('utf-8')}")
+            reply = decrypt_data(shared_key, enc_reply)
+            print("\n[Server Reply]:")
+            print(reply.decode("utf-8"))
             print()
 
-    except ConnectionRefusedError:
-        print("[!] connection refused - is the server running?")
-    except KeyboardInterrupt:
-        print("\n[*] interrupted by user")
     except Exception as e:
         print(f"[!] error: {e}")
+
     finally:
         sock.close()
         print("[*] connection closed")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
