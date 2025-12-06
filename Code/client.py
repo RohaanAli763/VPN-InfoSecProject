@@ -9,7 +9,7 @@ from encryption import generate_dh_keypair, compute_shared_key, encrypt_data, de
 from cryptography.hazmat.primitives.serialization import load_pem_parameters
 
 # Configure these
-SERVER_HOST = "myfirstvpn.duckdns.org"
+SERVER_HOST = "myfirstvpnnust.duckdns.org"
 SERVER_PORT = 5555
 BUF = 65536
 
