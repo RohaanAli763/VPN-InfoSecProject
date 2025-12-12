@@ -1,0 +1,8 @@
+{
+    "default_server": {
+        "name": "Manual Server (LAN)",
+        "host": "192.168.1.100",
+        "port": 5555,
+        "country": "Local"
+    }
+}
