@@ -58,4 +58,6 @@ def encrypt_data(shared_key, plaintext_bytes):
 
 def decrypt_data(shared_key, encrypted_bytes):
     cipher = Fernet(shared_key)
-    return cipher.decrypt(encrypted_bytes)
+    # Disable timestamp validation (ttl=None) to prevent time-based token rejection
+    # This is safe for VPN use case where we control both endpoints
+    return cipher.decrypt(encrypted_bytes, ttl=None)

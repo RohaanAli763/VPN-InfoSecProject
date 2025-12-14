@@ -9,9 +9,9 @@ from encryption import generate_dh_keypair, compute_shared_key, encrypt_data, de
 from cryptography.hazmat.primitives.serialization import load_pem_parameters
 
 # Configure these
-SERVER_HOST = "myfirstvpnnust.duckdns.org"
+SERVER_HOST = "127.0.0.1"  # localhost for local testing
 SERVER_PORT = 5555
-BUF = 65536
+BUF = 131072  # 128KB to match server buffer size
 
 SOCKS_HOST = "127.0.0.1"
 SOCKS_PORT = 1080
@@ -24,19 +24,25 @@ TYPE_CLOSE        = 4
 TYPE_UDP          = 5
 
 def send_blob(sock, b):
-    sock.sendall(len(b).to_bytes(4, "big"))
-    sock.sendall(b)
+    # Send as single atomic write to prevent interleaving
+    msg = len(b).to_bytes(4, "big") + b
+    sock.sendall(msg)
 
 def recv_blob(sock):
     raw = sock.recv(4)
     if not raw:
         return None
     ln = int.from_bytes(raw, "big")
+    
+    # Sanity check: reject unreasonably large blobs
+    if ln > 10 * 1024 * 1024:
+        raise ValueError(f"blob size too large: {ln} bytes")
+    
     data = b''
     while len(data) < ln:
         chunk = sock.recv(min(BUF, ln - len(data)))
         if not chunk:
-            raise ConnectionError("unexpected EOF")
+            raise ConnectionError(f"unexpected EOF (got {len(data)}/{ln} bytes)")
         data += chunk
     return data
 
