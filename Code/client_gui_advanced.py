@@ -2,418 +2,25 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import socket
 import threading
-import struct
-import itertools
-import sys
 import time
 from datetime import datetime
 from encryption import generate_dh_keypair, compute_shared_key, encrypt_data, decrypt_data
 from cryptography.hazmat.primitives.serialization import load_pem_parameters
 
-# Configure these
-SERVER_HOST = "myfirstvpnnust.duckdns.org"  # DuckDNS domain for remote access
-SERVER_PORT = 5555
-BUF = 131072  # 128KB to match server buffer size
-
-SOCKS_HOST = "127.0.0.1"
-SOCKS_PORT = 1080
-
-# Frame types (must match server)
-TYPE_CONNECT_REQ  = 1
-TYPE_CONNECT_RESP = 2
-TYPE_DATA         = 3
-TYPE_CLOSE        = 4
-TYPE_UDP          = 5
-
-def send_blob(sock, b):
-    # Send as single atomic write to prevent interleaving
-    msg = len(b).to_bytes(4, "big") + b
-    sock.sendall(msg)
-
-def recv_blob(sock):
-    raw = sock.recv(4)
-    if not raw:
-        return None
-    ln = int.from_bytes(raw, "big")
-    
-    # Sanity check: reject unreasonably large blobs
-    if ln > 10 * 1024 * 1024:
-        raise ValueError(f"blob size too large: {ln} bytes")
-    
-    data = b''
-    while len(data) < ln:
-        chunk = sock.recv(min(BUF, ln - len(data)))
-        if not chunk:
-            raise ConnectionError(f"unexpected EOF (got {len(data)}/{ln} bytes)")
-        data += chunk
-    return data
-
-def build_frame(ftype, conn_id, payload=b''):
-    return struct.pack("!BII", ftype, conn_id, len(payload)) + payload
-
-def parse_frame(b):
-    if len(b) < 9:
-        raise ValueError("frame too short")
-    ftype = b[0]
-    conn_id = struct.unpack("!I", b[1:5])[0]
-    payload_len = struct.unpack("!I", b[5:9])[0]
-    payload = b[9:9+payload_len]
-    return ftype, conn_id, payload
-
-class EncryptedTunnel:
-    def __init__(self, server_host, server_port):
-        self.server_host = server_host
-        self.server_port = server_port
-        self.sock = None
-        self.shared_key = None
-        self.conn_id_iter = itertools.count(1)
-        # maps conn_id -> (local_socket, ready_event, optional_resp)
-        self.local_map = {}
-        self.map_lock = threading.Lock()
-        # UDP handling: we will create a local UDP socket that browser/app will send to (after UDP ASSOCIATE). Key: conn_id -> local_udp_src (ip,port)
-        self.udp_map = {}  # conn_id -> (local_udp_ip, local_udp_port)
-        self.udp_map_lock = threading.Lock()
-
-    def connect_and_handshake(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        print(f"[*] connecting to VPN server {self.server_host}:{self.server_port} ...")
-        s.connect((self.server_host, self.server_port))
-        # receive params and server pub
-        params_bytes = recv_blob(s)
-        server_pub = recv_blob(s)
-        params = load_pem_parameters(params_bytes)
-        client_priv, client_pub_bytes = generate_dh_keypair(params)
-        send_blob(s, client_pub_bytes)
-        self.shared_key = compute_shared_key(client_priv, server_pub)
-        self.sock = s
-        print("[+] shared key established.")
-        t = threading.Thread(target=self.reader, daemon=True)
-        t.start()
-
-    def reader(self):
-        try:
-            while True:
-                enc = recv_blob(self.sock)
-                if enc is None:
-                    break
-                frame = decrypt_data(self.shared_key, enc)
-                ftype, cid, payload = parse_frame(frame)
-                if ftype == TYPE_CONNECT_RESP:
-                    with self.map_lock:
-                        entry = self.local_map.get(cid)
-                        if entry:
-                            # append response bytes and signal
-                            entry.append(payload)
-                            entry[1].set()
-                elif ftype == TYPE_DATA:
-                    with self.map_lock:
-                        entry = self.local_map.get(cid)
-                    if entry:
-                        localsock, ready_event = entry[0], entry[1]
-                        try:
-                            localsock.sendall(payload)
-                        except Exception:
-                            try:
-                                localsock.close()
-                            except:
-                                pass
-                            # notify server we closed
-                            frame = build_frame(TYPE_CLOSE, cid, b'')
-                            encf = encrypt_data(self.shared_key, frame)
-                            send_blob(self.sock, encf)
-                            with self.map_lock:
-                                if cid in self.local_map: del self.local_map[cid]
-                elif ftype == TYPE_CLOSE:
-                    with self.map_lock:
-                        entry = self.local_map.pop(cid, None)
-                    if entry:
-                        localsock, _ = entry[:2]
-                        try:
-                            localsock.close()
-                        except:
-                            pass
-                elif ftype == TYPE_UDP:
-                    # payload: client_src_ip + \x00 + client_src_port + \x00 + dest_host + \x00 + dest_port + \x00 + udp_payload
-                    try:
-                        parts = payload.split(b'\x00', 4)
-                        if len(parts) < 5:
-                            continue
-                        client_src_ip = parts[0].decode()
-                        client_src_port = int(parts[1].decode())
-                        dest_host = parts[2].decode()
-                        dest_port = int(parts[3].decode())
-                        udp_payload = parts[4]
-                    except Exception:
-                        continue
-                    # find local udp socket for this conn_id and send the response to the local UDP source
-                    with self.udp_map_lock:
-                        tup = self.udp_map.get(cid)
-                    if tup:
-                        local_udp_sock = tup[2]
-                        try:
-                            local_udp_sock.sendto(udp_payload, (client_src_ip, client_src_port))
-                        except Exception:
-                            pass
-                else:
-                    pass
-        except Exception as e:
-            print("tunnel reader error:", e)
-        finally:
-            print("[*] Tunnel reader exiting")
-            try:
-                self.sock.close()
-            except:
-                pass
-
-    def open_proxy_connection(self, localsock, dest_host, dest_port):
-        cid = next(self.conn_id_iter)
-        ready_event = threading.Event()
-        entry = [localsock, ready_event]  # later append resp
-        with self.map_lock:
-            self.local_map[cid] = entry
-        payload = f"{dest_host}:{dest_port}".encode()
-        frame = build_frame(TYPE_CONNECT_REQ, cid, payload)
-        enc = encrypt_data(self.shared_key, frame)
-        send_blob(self.sock, enc)
-        waited = ready_event.wait(timeout=15)
-        if not waited:
-            with self.map_lock:
-                if cid in self.local_map: del self.local_map[cid]
-            raise ConnectionError("no response from server")
-        with self.map_lock:
-            entry = self.local_map.get(cid)
-        resp = entry[2] if len(entry) >= 3 else b"ERR"
-        if not resp.startswith(b"OK"):
-            with self.map_lock:
-                if cid in self.local_map: del self.local_map[cid]
-            raise ConnectionError(resp.decode(errors='ignore'))
-        # start writer
-        t = threading.Thread(target=self._local_to_tunnel_writer, args=(cid, localsock), daemon=True)
-        t.start()
-        return cid
-
-    def _local_to_tunnel_writer(self, cid, localsock):
-        try:
-            while True:
-                data = localsock.recv(BUF)
-                if not data:
-                    break
-                frame = build_frame(TYPE_DATA, cid, data)
-                enc = encrypt_data(self.shared_key, frame)
-                send_blob(self.sock, enc)
-        except Exception:
-            pass
-        finally:
-            try:
-                frame = build_frame(TYPE_CLOSE, cid, b'')
-                enc = encrypt_data(self.shared_key, frame)
-                send_blob(self.sock, enc)
-            except:
-                pass
-            with self.map_lock:
-                if cid in self.local_map: del self.local_map[cid]
-            try:
-                localsock.close()
-            except:
-                pass
-
-    def open_udp_associate(self):
-        """
-        Called when SOCKS5 client requests UDP ASSOCIATE.
-        Create a local UDP socket bound to 127.0.0.1:0 and return whichever port.
-        We'll associate a special conn_id for UDP relay.
-        """
-        cid = next(self.conn_id_iter)
-        local_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        local_udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        local_udp.bind(("127.0.0.1", 0))
-        local_ip, local_port = local_udp.getsockname()
-        # store it to udp_map so reader thread can route responses
-        with self.udp_map_lock:
-            self.udp_map[cid] = (local_ip, local_port, local_udp)
-        # start local listener to read from browser and forward to server encapsulated
-        t = threading.Thread(target=self._udp_local_reader, args=(cid, local_udp), daemon=True)
-        t.start()
-        return cid, local_ip, local_port, local_udp
-
-    def _udp_local_reader(self, cid, local_udp_sock):
-        """
-        Read UDP datagrams from local socket (browser/app) and send them encapsulated to server.
-        Payload format to server: client_src_ip \x00 client_src_port \x00 dest_host \x00 dest_port \x00 udp_payload
-        We need to parse the SOCKS5 UDP request format which the browser will send:
-        SOCKS5 UDP request: [RSV(2)][FRAG(1)][ATYP(1)][DST.ADDR][DST.PORT(2)][DATA]
-        We'll receive these datagrams, extract dest, then send encapsulated version to server.
-        """
-        try:
-            while True:
-                data, src = local_udp_sock.recvfrom(65535)
-                # parse SOCKS5 UDP request header
-                if len(data) < 4:
-                    continue
-                # RSV (2 bytes) FRAG (1) ATYP (1)
-                rsv = data[0:2]
-                frag = data[2]
-                atyp = data[3]
-                idx = 4
-                if atyp == 0x01:  # IPv4
-                    if len(data) < idx+4+2: continue
-                    dest_addr = socket.inet_ntoa(data[idx:idx+4])
-                    idx += 4
-                elif atyp == 0x03:  # domain
-                    domain_len = data[idx]
-                    idx += 1
-                    dest_addr = data[idx:idx+domain_len].decode()
-                    idx += domain_len
-                elif atyp == 0x04:
-                    # IPv6 not supported here
-                    continue
-                else:
-                    continue
-                dest_port = struct.unpack("!H", data[idx:idx+2])[0]
-                idx += 2
-                udp_payload = data[idx:]
-                # build encapsulated payload
-                client_src_ip = src[0]
-                client_src_port = src[1]
-                payload = client_src_ip.encode() + b"\x00" + str(client_src_port).encode() + b"\x00" + dest_addr.encode() + b"\x00" + str(dest_port).encode() + b"\x00" + udp_payload
-                frame = build_frame(TYPE_UDP, cid, payload)
-                enc = encrypt_data(self.shared_key, frame)
-                send_blob(self.sock, enc)
-        except Exception:
-            pass
-        finally:
-            with self.udp_map_lock:
-                ent = self.udp_map.pop(cid, None)
-            try:
-                local_udp_sock.close()
-            except:
-                pass
-
-def handle_socks5_connection(tunnel, localsock, addr):
-    try:
-        # Initial greeting
-        data = localsock.recv(262)
-        if not data:
-            localsock.close(); return
-        if data[0] != 0x05:
-            localsock.close(); return
-        # respond: version 5, no auth
-        localsock.sendall(b"\x05\x00")
-        # request: VER CMD RSV ATYP ...
-        req = localsock.recv(4)
-        if len(req) < 4:
-            localsock.close(); return
-        ver, cmd, rsv, atyp = req[0], req[1], req[2], req[3]
-        if ver != 0x05:
-            localsock.close(); return
-        if cmd == 0x01:  # CONNECT
-            # parse target
-            if atyp == 0x01:  # IPv4
-                addr_bytes = localsock.recv(4)
-                dest = socket.inet_ntoa(addr_bytes)
-            elif atyp == 0x03:  # domain
-                ln = localsock.recv(1)[0]
-                dest = localsock.recv(ln).decode()
-            elif atyp == 0x04:  # IPv6 not supported
-                localsock.close(); return
-            else:
-                localsock.close(); return
-            port_bytes = localsock.recv(2)
-            dest_port = struct.unpack("!H", port_bytes)[0]
-
-            # open connection via encrypted tunnel
-            try:
-                cid = tunnel.open_proxy_connection(localsock, dest, dest_port)
-            except Exception as e:
-                # reply failure
-                localsock.sendall(b"\x05\x01\x00\x01" + b"\x00\x00\x00\x00" + b"\x00\x00")
-                localsock.close()
-                return
-
-            # reply success (bound addr = 0.0.0.0:0)
-            localsock.sendall(b"\x05\x00\x00\x01" + b"\x00\x00\x00\x00" + b"\x00\x00")
-
-            # After this, tunnel writer & reader handle forwarding.
-            # Just wait for socket close
-            try:
-                while True:
-                    # busy wait with small sleep so thread doesn't die
-                    if localsock.fileno() == -1:
-                        break
-                    # peek to detect closure
-                    try:
-                        data = localsock.recv(1, socket.MSG_PEEK)
-                        if not data:
-                            break
-                    except Exception:
-                        pass
-                    time.sleep(0.2)
-            except Exception:
-                pass
-            try:
-                localsock.close()
-            except:
-                pass
-
-        elif cmd == 0x03:  # UDP ASSOCIATE
-            # per RFC, client sends UDP ASSOCIATE to tell proxy it wants to send UDP datagrams
-            # We'll create a local UDP socket and return its address as BND.ADDR so the client (browser) will send UDP to it.
-            cid, local_ip, local_port, local_udp_sock = tunnel.open_udp_associate()
-            # reply with success and BND.ADDR/BND.PORT = local_ip:local_port
-            # Build reply: VER(5) REP(0) RSV(0) ATYP + ADDR + PORT
-            try:
-                # IPv4 only
-                ip_bytes = socket.inet_aton(local_ip)
-                port_bytes = struct.pack("!H", local_port)
-                localsock.sendall(b"\x05\x00\x00\x01" + ip_bytes + port_bytes)
-            except Exception:
-                localsock.sendall(b"\x05\x01\x00\x01" + b"\x00\x00\x00\x00" + b"\x00\x00")
-                localsock.close()
-                return
-
-            # Keep TCP connection open; UDP reading/encapsulation happens in separate thread.
-            try:
-                while True:
-                    time.sleep(1)
-                    # keep alive while localsock exists
-                    if localsock.fileno() == -1:
-                        break
-            except Exception:
-                pass
-            finally:
-                try:
-                    localsock.close()
-                except:
-                    pass
-
-        else:
-            # unsupported command
-            localsock.sendall(b"\x05\x07\x00\x01" + b"\x00\x00\x00\x00" + b"\x00\x00")
-            localsock.close()
-            return
-
-    except Exception:
-        pass
-    finally:
-        try:
-            localsock.close()
-        except:
-            pass
-
 class AdvancedVPNClient:
-    """Professional VPN Client with enhanced UI and full SOCKS5 functionality"""
+    """Professional VPN Client with enhanced UI"""
     
     def __init__(self, root):
         self.root = root
-        self.root.title("SecureVPN Pro - SOCKS5 Proxy")
+        self.root.title("SecureVPN Pro")
         self.root.geometry("1100x750")
         self.root.configure(bg='#0a0e27')
         
         # Default server
         self.selected_server = {
             "name": "Custom Server",
-            "host": SERVER_HOST,
-            "port": SERVER_PORT,
+            "host": "192.168.1.100",
+            "port": 5555,
             "location": "Local Network"
         }
         
@@ -421,10 +28,11 @@ class AdvancedVPNClient:
         self.setup_styles()
         
         # Connection state
-        self.tunnel = None
-        self.socks_server = None
+        self.sock = None
+        self.shared_key = None
         self.connected = False
-        self.socks_listening = False
+        self.receive_thread = None
+        self.BUF = 65536
         
         # Statistics
         self.bytes_sent = 0
@@ -436,7 +44,8 @@ class AdvancedVPNClient:
         self.upload_speed = 0
         self.download_speed = 0
         self.ping_ms = 0
-        self.active_connections = 0
+        self.messages_sent = 0
+        self.messages_received = 0
         
         self.setup_ui()
         
@@ -472,7 +81,7 @@ class AdvancedVPNClient:
         tk.Label(header, text="SecureVPN", font=('Arial', 24, 'bold'),
                 fg=self.text_white, bg=self.bg_secondary).pack(side=tk.LEFT, padx=30, pady=20)
         
-        version = tk.Label(header, text="Pro v2.1 - SOCKS5", font=('Arial', 10),
+        version = tk.Label(header, text="Pro v2.1", font=('Arial', 10),
                           fg=self.text_dark, bg=self.bg_secondary)
         version.pack(side=tk.LEFT, pady=20)
         
@@ -569,13 +178,6 @@ class AdvancedVPNClient:
                                       fg=self.text_gray, bg=self.bg_tertiary)
         self.server_details.pack(anchor='w', pady=(5, 0))
         
-        # SOCKS5 info
-        socks_info = tk.Label(info_frame,
-                             text=f"SOCKS5: {SOCKS_HOST}:{SOCKS_PORT}",
-                             font=('Arial', 9),
-                             fg=self.accent_blue, bg=self.bg_tertiary)
-        socks_info.pack(anchor='w', pady=(5, 0))
-        
         # Configure button
         config_btn = tk.Button(card, text="Configure Server",
                               command=self.open_server_config,
@@ -633,7 +235,7 @@ class AdvancedVPNClient:
         stats_data2 = [
             ('upload_total', 'Total Upload', '0 KB'),
             ('download_total', 'Total Download', '0 KB'),
-            ('connections', 'Active Connections', '0')
+            ('messages', 'Messages', '0 sent / 0 received')
         ]
         
         for i, (key, label, value) in enumerate(stats_data2):
@@ -653,25 +255,43 @@ class AdvancedVPNClient:
             stats_grid2.columnconfigure(i, weight=1)
     
     def _build_activity_panel(self, parent):
-        """Logs and activity"""
+        """Logs and messages"""
         panel = self.create_panel(parent)
         panel.pack(fill=tk.BOTH, expand=True)
         
-        # Title
-        tk.Label(panel, text="Activity Log", font=('Arial', 11, 'bold'),
-                fg=self.text_gray, bg=self.bg_secondary).pack(anchor='w', padx=25, pady=(20, 15))
+        # Tabs
+        tab_frame = tk.Frame(panel, bg=self.bg_secondary)
+        tab_frame.pack(fill=tk.X, padx=25, pady=(20, 0))
+        
+        self.active_tab = 'logs'
+        
+        logs_tab = tk.Button(tab_frame, text="Activity Log",
+                            command=lambda: self.switch_tab('logs'),
+                            font=('Arial', 10, 'bold'),
+                            bg=self.bg_tertiary, fg=self.text_white,
+                            relief='flat', padx=20, pady=10, cursor='hand2')
+        logs_tab.pack(side=tk.LEFT, padx=(0, 5))
+        
+        chat_tab = tk.Button(tab_frame, text="Messages",
+                            command=lambda: self.switch_tab('chat'),
+                            font=('Arial', 10),
+                            bg=self.bg_secondary, fg=self.text_gray,
+                            relief='flat', padx=20, pady=10, cursor='hand2')
+        chat_tab.pack(side=tk.LEFT)
+        
+        self.tab_buttons = {'logs': logs_tab, 'chat': chat_tab}
         
         # Content area
         content_frame = tk.Frame(panel, bg=self.bg_secondary)
-        content_frame.pack(fill=tk.BOTH, expand=True, padx=25, pady=(0, 15))
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=25, pady=15)
         
         # Logs
         self.logs_display = scrolledtext.ScrolledText(content_frame,
                                                       wrap=tk.WORD,
                                                       font=('Consolas', 9),
                                                       bg=self.bg_primary,
-                                                      fg="#22c55e",
-                                                      insertbackground="#22c55e",
+                                                      fg="#22c5b2",
+                                                      insertbackground="#22c5c2",
                                                       relief='flat',
                                                       padx=15, pady=15,
                                                       state='disabled')
@@ -682,7 +302,59 @@ class AdvancedVPNClient:
         self.logs_display.tag_config('error', foreground='#ef4444')
         self.logs_display.tag_config('warning', foreground='#f59e0b')
         
-        self.log(f"VPN client initialized. SOCKS5 proxy will run on {SOCKS_HOST}:{SOCKS_PORT}", 'info')
+        # Chat (hidden initially)
+        self.chat_frame = tk.Frame(content_frame, bg=self.bg_secondary)
+        
+        self.messages_display = scrolledtext.ScrolledText(self.chat_frame,
+                                                          wrap=tk.WORD,
+                                                          font=('Arial', 10),
+                                                          bg=self.bg_primary,
+                                                          fg=self.text_white,
+                                                          relief='flat',
+                                                          padx=15, pady=15,
+                                                          state='disabled')
+        self.messages_display.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        
+        self.messages_display.tag_config('you', foreground='#3b82f6', font=('Arial', 10, 'bold'))
+        self.messages_display.tag_config('server', foreground='#10b981', font=('Arial', 10, 'bold'))
+        
+        # Message input
+        input_frame = tk.Frame(self.chat_frame, bg=self.bg_secondary)
+        input_frame.pack(fill=tk.X)
+        
+        self.message_input = tk.Entry(input_frame, font=('Arial', 10),
+                                     bg=self.bg_tertiary, fg=self.text_white,
+                                     insertbackground=self.accent_blue,
+                                     relief='flat', state='disabled')
+        self.message_input.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, ipady=8, padx=(0, 10))
+        self.message_input.bind('<Return>', lambda e: self.send_message())
+        
+        self.send_button = tk.Button(input_frame, text="Send",
+                                     command=self.send_message,
+                                     bg=self.accent_blue, fg=self.text_white,
+                                     font=('Arial', 10, 'bold'),
+                                     relief='flat', padx=25, pady=8,
+                                     cursor='hand2', state='disabled')
+        self.send_button.pack(side=tk.RIGHT)
+        
+        self.log("VPN client initialized. Configure server to begin.", 'info')
+    
+    def switch_tab(self, tab_name):
+        """Switch between tabs"""
+        self.active_tab = tab_name
+        
+        for name, btn in self.tab_buttons.items():
+            if name == tab_name:
+                btn.config(bg=self.bg_tertiary, fg=self.text_white, font=('Arial', 10, 'bold'))
+            else:
+                btn.config(bg=self.bg_secondary, fg=self.text_gray, font=('Arial', 10))
+        
+        if tab_name == 'logs':
+            self.chat_frame.pack_forget()
+            self.logs_display.pack(fill=tk.BOTH, expand=True)
+        else:
+            self.logs_display.pack_forget()
+            self.chat_frame.pack(fill=tk.BOTH, expand=True)
     
     def open_server_config(self):
         """Server configuration dialog"""
@@ -792,6 +464,38 @@ class AdvancedVPNClient:
         self.logs_display.see(tk.END)
         self.logs_display.config(state='disabled')
     
+    def add_chat_message(self, text, sender='server'):
+        """Add chat message"""
+        self.messages_display.config(state='normal')
+        if sender == 'you':
+            self.messages_display.insert(tk.END, "You: ", 'you')
+            self.messages_sent += 1
+        else:
+            self.messages_display.insert(tk.END, "Server: ", 'server')
+            self.messages_received += 1
+        self.messages_display.insert(tk.END, f"{text}\n")
+        self.messages_display.see(tk.END)
+        self.messages_display.config(state='disabled')
+    
+    def measure_ping(self):
+        """Measure latency to server"""
+        if not self.connected or not self.sock:
+            return
+        
+        try:
+            start = time.time()
+            # Send a small ping packet
+            ping_msg = b"PING"
+            enc_ping = encrypt_data(self.shared_key, ping_msg)
+            self.send_data(enc_ping)
+            
+            # Calculate round-trip time (simplified - actual pong comes in receive loop)
+            # This is an approximation
+            elapsed = (time.time() - start) * 1000
+            self.ping_ms = int(elapsed)
+        except:
+            pass
+    
     def update_stats(self):
         """Update statistics display"""
         if self.connected and self.connection_start_time:
@@ -807,26 +511,44 @@ class AdvancedVPNClient:
             if self.last_speed_update:
                 time_diff = current_time - self.last_speed_update
                 if time_diff >= 1.0:  # Update every second
-                    if self.tunnel:
-                        # Get stats from tunnel
-                        with self.tunnel.map_lock:
-                            conn_count = len(self.tunnel.local_map)
-                        self.active_connections = conn_count
+                    bytes_sent_diff = self.bytes_sent - self.last_bytes_sent
+                    bytes_recv_diff = self.bytes_received - self.last_bytes_received
                     
+                    self.upload_speed = int(bytes_sent_diff / time_diff)
+                    self.download_speed = int(bytes_recv_diff / time_diff)
+                    
+                    self.last_bytes_sent = self.bytes_sent
+                    self.last_bytes_received = self.bytes_received
                     self.last_speed_update = current_time
             else:
                 self.last_speed_update = current_time
+                self.last_bytes_sent = self.bytes_sent
+                self.last_bytes_received = self.bytes_received
             
-            # Update display (placeholder speeds for now)
-            self.stat_widgets['upload_speed'].config(text=f"{self.upload_speed // 1024} KB/s")
-            self.stat_widgets['download_speed'].config(text=f"{self.download_speed // 1024} KB/s")
+            # Update display
+            if self.upload_speed < 1024:
+                upload_text = f"{self.upload_speed} B/s"
+            else:
+                upload_text = f"{self.upload_speed // 1024} KB/s"
+            
+            if self.download_speed < 1024:
+                download_text = f"{self.download_speed} B/s"
+            else:
+                download_text = f"{self.download_speed // 1024} KB/s"
+            
+            self.stat_widgets['upload_speed'].config(text=upload_text)
+            self.stat_widgets['download_speed'].config(text=download_text)
             
             # Total data
             self.stat_widgets['upload_total'].config(text=f"{self.bytes_sent // 1024} KB")
             self.stat_widgets['download_total'].config(text=f"{self.bytes_received // 1024} KB")
             
-            # Active connections
-            self.stat_widgets['connections'].config(text=f"{self.active_connections}")
+            # Messages
+            self.stat_widgets['messages'].config(text=f"{self.messages_sent} sent / {self.messages_received} received")
+            
+            # Ping (measure periodically)
+            if elapsed % 5 == 0:  # Measure every 5 seconds
+                threading.Thread(target=self.measure_ping, daemon=True).start()
             
             self.stat_widgets['ping'].config(text=f"{self.ping_ms} ms")
     
@@ -850,14 +572,30 @@ class AdvancedVPNClient:
             host = self.selected_server['host']
             port = self.selected_server['port']
             
-            # Create tunnel
-            self.tunnel = EncryptedTunnel(host, port)
+            # Connect
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(10)
             
             ping_start = time.time()
-            self.tunnel.connect_and_handshake()
+            self.sock.connect((host, port))
             self.ping_ms = int((time.time() - ping_start) * 1000)
             
-            self.log("VPN tunnel established", 'success')
+            self.log("TCP connection established", 'success')
+            
+            # DH key exchange
+            params_data = self.recv_data()
+            client_params = load_pem_parameters(params_data)
+            self.log("Received DH parameters", 'info')
+            
+            server_pub = self.recv_data()
+            self.log("Received server public key", 'info')
+            
+            client_priv, client_pub = generate_dh_keypair(client_params)
+            self.send_data(client_pub)
+            self.log("Sent client public key", 'info')
+            
+            self.shared_key = compute_shared_key(client_priv, server_pub)
+            self.log("Encryption established (AES-128)", 'success')
             
             # Update state
             self.connected = True
@@ -869,15 +607,16 @@ class AdvancedVPNClient:
             self.last_speed_update = time.time()
             self.upload_speed = 0
             self.download_speed = 0
-            self.active_connections = 0
+            self.messages_sent = 0
+            self.messages_received = 0
             
             self.root.after(0, self._update_connected_ui)
             
-            # Start stats updater
+            # Start receive loop
+            threading.Thread(target=self._receive_worker, daemon=True).start()
             self.root.after(1000, self._stats_updater)
             
-            # Start SOCKS5 server
-            threading.Thread(target=self._start_socks_server, daemon=True).start()
+            self.add_chat_message(f"Connected to {host}:{port}", 'server')
             
         except socket.timeout:
             self.log(f"Connection timeout: {self.selected_server['host']}:{self.selected_server['port']}", 'error')
@@ -889,41 +628,6 @@ class AdvancedVPNClient:
             self.log(f"Connection failed: {e}", 'error')
             self.root.after(0, self._update_disconnected_ui)
     
-    def _start_socks_server(self):
-        """Start local SOCKS5 server"""
-        try:
-            self.socks_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socks_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.socks_server.bind((SOCKS_HOST, SOCKS_PORT))
-            self.socks_server.listen(128)
-            self.socks_listening = True
-            
-            self.log(f"SOCKS5 proxy listening on {SOCKS_HOST}:{SOCKS_PORT}", 'success')
-            self.log("Configure your browser to use this SOCKS5 proxy", 'info')
-            
-            while self.connected and self.socks_listening:
-                try:
-                    self.socks_server.settimeout(1.0)
-                    c, a = self.socks_server.accept()
-                    t = threading.Thread(target=handle_socks5_connection, 
-                                       args=(self.tunnel, c, a), daemon=True)
-                    t.start()
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    if self.connected:
-                        self.log(f"SOCKS5 accept error: {e}", 'error')
-                    break
-        except Exception as e:
-            self.log(f"SOCKS5 server error: {e}", 'error')
-        finally:
-            if self.socks_server:
-                try:
-                    self.socks_server.close()
-                except:
-                    pass
-            self.socks_listening = False
-    
     def _update_connected_ui(self):
         """Update UI for connected state"""
         self.status_indicator.itemconfig(self.status_circle, fill=self.accent_green)
@@ -931,6 +635,8 @@ class AdvancedVPNClient:
         self.connection_info.config(text=f"{self.selected_server['host']}:{self.selected_server['port']}")
         self.connect_btn.config(state='normal', text="Disconnect", 
                                bg=self.accent_red, activebackground='#dc2626')
+        self.message_input.config(state='normal')
+        self.send_button.config(state='normal')
     
     def _update_disconnected_ui(self):
         """Update UI for disconnected state"""
@@ -939,12 +645,14 @@ class AdvancedVPNClient:
         self.connection_info.config(text="Not connected")
         self.connect_btn.config(state='normal', text="Connect",
                                bg=self.accent_green, activebackground='#059669')
+        self.message_input.config(state='disabled')
+        self.send_button.config(state='disabled')
         self.stat_widgets['duration'].config(text='00:00:00')
         self.stat_widgets['upload_speed'].config(text='0 KB/s')
         self.stat_widgets['download_speed'].config(text='0 KB/s')
         self.stat_widgets['upload_total'].config(text='0 KB')
         self.stat_widgets['download_total'].config(text='0 KB')
-        self.stat_widgets['connections'].config(text='0')
+        self.stat_widgets['messages'].config(text='0 sent / 0 received')
         self.stat_widgets['ping'].config(text='0 ms')
     
     def _stats_updater(self):
@@ -953,28 +661,77 @@ class AdvancedVPNClient:
             self.update_stats()
             self.root.after(1000, self._stats_updater)
     
+    def _receive_worker(self):
+        """Background message receiver"""
+        while self.connected:
+            try:
+                enc_data = self.recv_data()
+                self.bytes_received += len(enc_data)
+                plaintext = decrypt_data(self.shared_key, enc_data)
+                message = plaintext.decode('utf-8')
+                
+                self.root.after(0, lambda m=message: self.add_chat_message(m, 'server'))
+            except Exception as e:
+                if self.connected:
+                    self.log(f"Receive error: {e}", 'error')
+                break
+        
+        if self.connected:
+            self.disconnect()
+    
+    def send_data(self, data):
+        """Send length-prefixed data"""
+        self.sock.sendall(len(data).to_bytes(4, 'big'))
+        self.sock.sendall(data)
+    
+    def recv_data(self):
+        """Receive length-prefixed data"""
+        length_bytes = self.sock.recv(4)
+        if not length_bytes:
+            raise ConnectionError("Connection closed")
+        
+        data_len = int.from_bytes(length_bytes, 'big')
+        data = b''
+        while len(data) < data_len:
+            chunk = self.sock.recv(min(self.BUF, data_len - len(data)))
+            if not chunk:
+                raise ConnectionError("Connection closed")
+            data += chunk
+        return data
+    
+    def send_message(self):
+        """Send chat message"""
+        if not self.connected:
+            return
+        
+        message = self.message_input.get().strip()
+        if not message:
+            return
+        
+        try:
+            enc_msg = encrypt_data(self.shared_key, message.encode('utf-8'))
+            self.bytes_sent += len(enc_msg)
+            self.send_data(enc_msg)
+            
+            self.add_chat_message(message, 'you')
+            self.log("Message sent", 'info')
+            self.message_input.delete(0, tk.END)
+        except Exception as e:
+            self.log(f"Send failed: {e}", 'error')
+    
     def disconnect(self):
         """Close VPN connection"""
         self.connected = False
-        self.socks_listening = False
-        
-        if self.socks_server:
+        if self.sock:
             try:
-                self.socks_server.close()
+                self.sock.close()
             except:
                 pass
-            self.socks_server = None
+        self.sock = None
+        self.shared_key = None
         
-        if self.tunnel and self.tunnel.sock:
-            try:
-                self.tunnel.sock.close()
-            except:
-                pass
-        
-        self.tunnel = None
-        
-        self.log("Disconnected from VPN", 'warning')
-        self.log("SOCKS5 proxy stopped", 'warning')
+        self.log("Disconnected", 'warning')
+        self.add_chat_message("Connection closed", 'server')
         self.root.after(0, self._update_disconnected_ui)
     
     def on_closing(self):
@@ -987,7 +744,7 @@ class AdvancedVPNClient:
         else:
             self.root.destroy()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     root = tk.Tk()
     app = AdvancedVPNClient(root)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
