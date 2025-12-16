@@ -4,7 +4,6 @@ import socket
 import threading
 import struct
 import itertools
-import sys
 import time
 from datetime import datetime
 from encryption import generate_dh_keypair, compute_shared_key, encrypt_data, decrypt_data
@@ -992,3 +991,10 @@ if __name__ == "__main__":
     app = AdvancedVPNClient(root)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()
+
+
+
+
+
+
+#1000th line yay
