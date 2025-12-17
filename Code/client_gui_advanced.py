@@ -12,7 +12,7 @@ class AdvancedVPNClient:
     
     def __init__(self, root):
         self.root = root
-        self.root.title("SecureVPN Pro")
+        self.root.title("SecureVPN")
         self.root.geometry("1100x750")
         self.root.configure(bg='#0a0e27')
         
